@@ -1,0 +1,86 @@
+use std::collections::BTreeSet;
+use std::path::Path;
+
+use dua::traverse::TreeIndex;
+use gix::ignore::Kind;
+
+use super::{EntryDataBundle, tree_view::TreeView};
+
+pub fn gitignored_entries(
+    tree_view: &TreeView<'_>,
+    current_path: &Path,
+    entries: &[EntryDataBundle],
+) -> BTreeSet<TreeIndex> {
+    use std::path::{Path, PathBuf};
+
+    fn absolute_path(path: PathBuf, cwd: &Path) -> PathBuf {
+        if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        }
+    }
+
+    fn mode(entry: &EntryDataBundle) -> gix::index::entry::Mode {
+        if entry.is_dir {
+            gix::index::entry::Mode::DIR
+        } else {
+            gix::index::entry::Mode::FILE
+        }
+    }
+
+    fn open_options(trust: gix::sec::Trust) -> gix::open::Options {
+        use gix::sec::trust::DefaultForLevel;
+
+        gix::open::Options::default_for_level(trust)
+            .config_overrides(["gitoxide.parsePrecious=true"])
+    }
+
+    let trust_map = gix::sec::trust::Mapping {
+        full: open_options(gix::sec::Trust::Full),
+        reduced: open_options(gix::sec::Trust::Reduced),
+    };
+    let Ok(repo) = gix::ThreadSafeRepository::discover_opts(
+        current_path,
+        gix::discover::upwards::Options::default(),
+        trust_map,
+    ) else {
+        return BTreeSet::new();
+    };
+    let repo = repo.to_thread_local();
+    let Ok(cwd) = std::env::current_dir() else {
+        return BTreeSet::new();
+    };
+    let Some(workdir) = repo.workdir() else {
+        return BTreeSet::new();
+    };
+    let workdir = absolute_path(workdir.to_owned(), &cwd);
+    // Discovery can simplify the Windows verbatim prefix retained by canonical entry paths.
+    let canonical_workdir = workdir.canonicalize().ok();
+    let Ok(index) = repo.index_or_empty() else {
+        return BTreeSet::new();
+    };
+    let Ok(mut excludes) = repo.excludes(
+        &index,
+        None,
+        gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped,
+    ) else {
+        return BTreeSet::new();
+    };
+
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let path = absolute_path(tree_view.path_of(entry.index), &cwd);
+            let relative_path = path
+                .strip_prefix(&workdir)
+                .ok()
+                .or_else(|| path.strip_prefix(canonical_workdir.as_ref()?).ok())?;
+            let platform = excludes.at_path(relative_path, Some(mode(entry))).ok()?;
+            platform
+                .excluded_kind()
+                .is_some_and(|kind| matches!(kind, Kind::Expendable))
+                .then_some(entry.index)
+        })
+        .collect()
+}

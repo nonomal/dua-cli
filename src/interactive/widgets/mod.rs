@@ -3,24 +3,26 @@ mod footer;
 mod glob;
 mod header;
 mod help;
+mod i18n;
 mod main;
 mod mark;
+mod tui_ext;
 
 pub use entries::*;
 pub use footer::*;
 pub use glob::*;
 pub use header::*;
 pub use help::*;
+pub use i18n::*;
 pub use main::*;
 pub use mark::*;
-use once_cell::sync::Lazy;
 
 use tui::style::Color;
 
 pub const COLOR_MARKED: Color = Color::Yellow;
 pub const COLOR_MARKED_DARK: Color = Color::Rgb(176, 126, 0);
 
-static COUNT: Lazy<human_format::Formatter> = Lazy::new(|| {
+static COUNT: std::sync::LazyLock<human_format::Formatter> = std::sync::LazyLock::new(|| {
     let mut formatter = human_format::Formatter::new();
     formatter.with_decimals(0).with_separator("");
     formatter

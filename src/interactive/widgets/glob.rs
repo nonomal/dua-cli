@@ -1,10 +1,17 @@
-use anyhow::{anyhow, Context, Result};
-use bstr::BString;
-use crosstermion::crossterm::event::KeyEventKind;
-use crosstermion::input::Key;
-use dua::traverse::{Tree, TreeIndex};
-use petgraph::Direction;
-use std::borrow::Borrow;
+use crate::interactive::widgets::Language;
+use crate::interactive::widgets::tui_ext::{
+    draw_text_nowrap_fn,
+    util::{block_width, rect},
+};
+use anyhow::{Context, Result, anyhow};
+use bstr::{BString, ByteSlice};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+use dua::{
+    KeysConfig,
+    traverse::{Tree, TreeIndex},
+};
+use gix::glob::pattern::Case;
+use std::{borrow::Borrow, path::PathBuf};
 use tui::{
     buffer::Buffer,
     layout::Rect,
@@ -12,21 +19,18 @@ use tui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Widget},
 };
-use tui_react::{
-    draw_text_nowrap_fn,
-    util::{block_width, rect},
-};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::interactive::state::Cursor;
 
-pub struct GlobPaneProps {
+pub struct GlobPaneProps<'a> {
     pub border_style: Style,
     pub has_focus: bool,
+    pub keys: &'a KeysConfig,
+    pub language: Language,
 }
 
-#[derive(Default)]
 pub struct GlobPane {
     pub input: String,
     /// The index of the grapheme the cursor currently points to.
@@ -34,29 +38,39 @@ pub struct GlobPane {
     /// and is treated as 'one character'. If not, it will be off, which isn't the end of the world.
     // TODO: use `tui-textarea` for proper cursor handling, needs native crossterm events.
     cursor_grapheme_idx: usize,
+    pub case: Case,
+}
+
+impl Default for GlobPane {
+    fn default() -> Self {
+        GlobPane {
+            input: String::new(),
+            cursor_grapheme_idx: 0,
+            case: Case::Fold,
+        }
+    }
 }
 
 impl GlobPane {
-    pub fn process_events(&mut self, key: Key) {
-        use crosstermion::crossterm::event::KeyCode::*;
+    pub fn process_events(&mut self, key: KeyEvent, keys: &KeysConfig) {
         if key.kind == KeyEventKind::Release {
             return;
         }
-        match key.code {
-            Char(to_insert) => {
-                self.enter_char(to_insert);
-            }
-            Backspace => {
-                self.delete_char();
-            }
-            Left => {
-                self.move_cursor_left();
-            }
-            Right => {
-                self.move_cursor_right();
-            }
-            _ => {}
-        };
+
+        if keys.search_toggle_case.matches(key) {
+            self.case = match self.case {
+                Case::Sensitive => Case::Fold,
+                Case::Fold => Case::Sensitive,
+            };
+        } else if keys.search_backspace.matches(key) {
+            self.delete_char();
+        } else if keys.search_left.matches(key) {
+            self.move_cursor_left();
+        } else if keys.search_right.matches(key) {
+            self.move_cursor_right();
+        } else if let KeyCode::Char(to_insert) = key.code {
+            self.enter_char(to_insert);
+        }
     }
 
     fn move_cursor_left(&mut self) {
@@ -74,7 +88,7 @@ impl GlobPane {
             self.input
                 .graphemes(true)
                 .take(self.cursor_grapheme_idx)
-                .map(|g| g.as_bytes().len())
+                .map(str::len)
                 .sum::<usize>(),
             new_char,
         );
@@ -101,19 +115,30 @@ impl GlobPane {
         new_cursor_pos.clamp(0, self.input.graphemes(true).count())
     }
 
-    pub fn render(
+    pub fn render<'a>(
         &mut self,
-        props: impl Borrow<GlobPaneProps>,
+        props: impl Borrow<GlobPaneProps<'a>>,
         area: Rect,
         buffer: &mut Buffer,
         cursor: &mut Cursor,
     ) {
+        if area.width < 4 || area.height < 3 {
+            cursor.show = false;
+            return;
+        }
         let GlobPaneProps {
             border_style,
             has_focus,
+            keys,
+            language,
         } = props.borrow();
 
-        let title = "Git-Glob";
+        let t = language.ui_text();
+        let title = match self.case {
+            Case::Sensitive => t.glob_case_sensitive,
+            Case::Fold => t.glob_case_insensitive,
+        };
+
         let block = Block::default()
             .title(title)
             .border_style(*border_style)
@@ -127,7 +152,7 @@ impl GlobPane {
             .render(margin_left_right(inner_block_area, 1), buffer);
 
         if *has_focus {
-            draw_top_right_help(area, title, buffer);
+            draw_top_right_help(area, title, buffer, keys, *language);
 
             cursor.show = true;
             cursor.x = inner_block_area.x
@@ -135,7 +160,7 @@ impl GlobPane {
                     .input
                     .graphemes(true)
                     .take(self.cursor_grapheme_idx)
-                    .map(|g| g.width())
+                    .map(UnicodeWidthStr::width)
                     .sum::<usize>() as u16
                 + 1;
             cursor.y = inner_block_area.y;
@@ -145,9 +170,24 @@ impl GlobPane {
     }
 }
 
-fn draw_top_right_help(area: Rect, title: &str, buf: &mut Buffer) -> Rect {
-    let help_text = " search = enter | cancel = esc ";
-    let help_text_block_width = block_width(help_text);
+fn draw_top_right_help(
+    area: Rect,
+    title: &str,
+    buf: &mut Buffer,
+    keys: &KeysConfig,
+    language: Language,
+) -> Rect {
+    let t = language.ui_text();
+    let help_text = format!(
+        " {} = {} | {} = {} | {} = {} ",
+        t.glob_search,
+        keys.search_confirm,
+        t.glob_case,
+        keys.search_toggle_case,
+        t.glob_cancel,
+        keys.close_pane
+    );
+    let help_text_block_width = block_width(&help_text);
     let bound = Rect {
         width: area.width.saturating_sub(1),
         ..area
@@ -156,7 +196,7 @@ fn draw_top_right_help(area: Rect, title: &str, buf: &mut Buffer) -> Rect {
         draw_text_nowrap_fn(
             rect::snap_to_right(bound, help_text_block_width),
             buf,
-            help_text,
+            &help_text,
             |_, _, _| Style::default(),
         );
     }
@@ -172,44 +212,188 @@ fn margin_left_right(r: Rect, margin: u16) -> Rect {
     }
 }
 
-fn glob_search_neighbours(
+fn glob_search_entry(
     results: &mut Vec<TreeIndex>,
     tree: &Tree,
-    root_index: TreeIndex,
-    glob: &gix_glob::Pattern,
+    entry: (TreeIndex, &std::path::Path),
+    glob: &gix::glob::Pattern,
     path: &mut BString,
+    case: Case,
 ) {
-    for node_index in tree.neighbors_directed(root_index, Direction::Outgoing) {
-        if let Some(node) = tree.node_weight(node_index) {
-            let previous_len = path.len();
-            let basename_start = if path.is_empty() {
-                None
-            } else {
-                path.push(b'/');
-                Some(previous_len + 1)
-            };
-            path.extend_from_slice(gix_path::into_bstr(&node.name).as_ref());
-            if glob.matches_repo_relative_path(
-                path.as_ref(),
-                basename_start,
-                Some(node.is_dir),
-                gix_glob::pattern::Case::Fold,
-                gix_glob::wildmatch::Mode::NO_MATCH_SLASH_LITERAL,
-            ) {
-                results.push(node_index);
-            } else {
-                glob_search_neighbours(results, tree, node_index, glob, path);
-            }
-            path.truncate(previous_len);
+    let (index, name) = entry;
+    if let Some(node) = tree.data(index) {
+        let previous_len = path.len();
+        if !path.is_empty() {
+            path.push(b'/');
         }
+        path.extend_from_slice(
+            gix::path::to_unix_separators_on_windows(gix::path::into_bstr(name)).as_ref(),
+        );
+        if glob.matches_repo_relative_path(
+            path.as_ref(),
+            path.rfind_byte(b'/').map(|position| position + 1),
+            Some(node.is_dir),
+            case,
+            gix::glob::wildmatch::Mode::NO_MATCH_SLASH_LITERAL,
+        ) {
+            results.push(index);
+        } else {
+            for child in tree.children(index) {
+                let name = tree.name(child).expect("child exists");
+                glob_search_entry(results, tree, (child, &name), glob, path, case);
+            }
+        }
+        path.truncate(previous_len);
     }
 }
 
-pub fn glob_search(tree: &Tree, root_index: TreeIndex, glob: &str) -> Result<Vec<TreeIndex>> {
-    let glob = gix_glob::Pattern::from_bytes_without_negation(glob.as_bytes())
-        .with_context(|| anyhow!("Glob was empty or only whitespace"))?;
+pub fn glob_search(
+    tree: &Tree,
+    entries: impl IntoIterator<Item = (TreeIndex, PathBuf)>,
+    glob: &str,
+    case: gix::glob::pattern::Case,
+    language: Language,
+) -> Result<Vec<TreeIndex>> {
+    let glob = gix::glob::Pattern::from_bytes_without_negation(glob.as_bytes())
+        .with_context(|| anyhow!(language.ui_text().glob_empty))?;
     let mut results = Vec::new();
-    let mut path = Default::default();
-    glob_search_neighbours(&mut results, tree, root_index, &glob, &mut path);
+    let mut path = BString::default();
+    for (index, name) in entries {
+        glob_search_entry(&mut results, tree, (index, &name), &glob, &mut path, case);
+    }
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEventKind, KeyEventState, KeyModifiers};
+    use tui::buffer::Cell;
+
+    #[test]
+    fn default_toggle_case_key_does_not_type_into_input() {
+        let mut glob_pane = GlobPane::default();
+        let keys = KeysConfig::default();
+        assert_eq!(glob_pane.input, "");
+        assert_eq!(glob_pane.case, Case::Fold); // default is case-insensitive
+
+        let ctrl_f = KeyEvent {
+            code: KeyCode::Char('f'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        glob_pane.process_events(ctrl_f, &keys);
+        assert_eq!(glob_pane.case, Case::Sensitive);
+        assert_eq!(glob_pane.input, "");
+
+        glob_pane.process_events(ctrl_f, &keys);
+        assert_eq!(glob_pane.case, Case::Fold);
+    }
+
+    #[test]
+    fn configured_character_bindings_take_precedence_over_text_input() {
+        let keys = toml::from_str::<dua::Config>(
+            r#"
+            [keys]
+            search_toggle_case = ["t"]
+            search_backspace = ["x"]
+            search_left = ["h"]
+            search_right = ["l"]
+            "#,
+        )
+        .expect("valid config")
+        .keys;
+        let mut glob_pane = GlobPane::default();
+
+        glob_pane.process_events(KeyCode::Char('a').into(), &keys);
+        glob_pane.process_events(KeyCode::Char('h').into(), &keys);
+        assert_eq!(glob_pane.cursor_grapheme_idx, 0);
+        glob_pane.process_events(KeyCode::Char('l').into(), &keys);
+        assert_eq!(glob_pane.cursor_grapheme_idx, 1);
+        glob_pane.process_events(KeyCode::Char('x').into(), &keys);
+        glob_pane.process_events(KeyCode::Char('t').into(), &keys);
+
+        assert_eq!(
+            glob_pane.input, "",
+            "configured bindings should not be typed into the input"
+        );
+        assert_eq!(
+            glob_pane.case,
+            Case::Sensitive,
+            "configured toggle binding should change case sensitivity"
+        );
+    }
+
+    #[test]
+    fn rendered_help_uses_configured_bindings() {
+        let keys = toml::from_str::<dua::Config>(
+            r#"
+            [keys]
+            close_pane = ["q"]
+            search_confirm = ["f2"]
+            search_toggle_case = ["alt+c"]
+            "#,
+        )
+        .expect("valid config")
+        .keys;
+        let area = Rect::new(0, 0, 100, 3);
+        let mut buffer = Buffer::empty(area);
+
+        GlobPane::default().render(
+            GlobPaneProps {
+                border_style: Style::default(),
+                has_focus: true,
+                keys: &keys,
+                language: Language::English,
+            },
+            area,
+            &mut buffer,
+            &mut Cursor::default(),
+        );
+
+        insta::assert_debug_snapshot!(
+            buffer,
+            "glob pane help with configured bindings",
+            @r#"
+        Buffer {
+            area: Rect { x: 0, y: 0, width: 100, height: 3 },
+            content: [
+                "┌Git-Glob (case-insensitive)────────────────────────── search = <F2> | case = Alt + c | cancel = q ┐",
+                "│                                                                                                  │",
+                "└──────────────────────────────────────────────────────────────────────────────────────────────────┘",
+            ],
+            styles: [
+                x: 0, y: 0, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
+            ]
+        }
+        "#
+        );
+    }
+
+    #[test]
+    fn pane_title_and_actions_follow_the_selected_language() {
+        let area = Rect::new(0, 0, 100, 3);
+        let mut buffer = Buffer::empty(area);
+
+        GlobPane::default().render(
+            GlobPaneProps {
+                border_style: Style::default(),
+                has_focus: true,
+                keys: &KeysConfig::default(),
+                language: Language::Chinese,
+            },
+            area,
+            &mut buffer,
+            &mut Cursor::default(),
+        );
+
+        let rendered: String = buffer.content.iter().map(Cell::symbol).collect();
+        let rendered: String = rendered.split_whitespace().collect();
+        assert!(rendered.contains("Git-Glob"));
+        assert!(rendered.contains("不区分大小写"));
+        assert!(rendered.contains("搜索"));
+        assert!(rendered.contains("取消"));
+        assert!(!rendered.contains("case-insensitive"));
+    }
 }

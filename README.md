@@ -4,26 +4,30 @@
 
 **dua** (-> _Disk Usage Analyzer_) is a tool to conveniently learn about the usage of disk space of a given directory. It's parallel by default and will max out your SSD, providing relevant information as fast as possible. Optionally delete superfluous data, and do so more quickly than `rm`.
 
+Run `dua i` to launch the [interactive mode](#interactive-mode) for exploring and deleting files.
+
 [![asciicast](https://asciinema.org/a/kDnXUOeqBxZVMoWuFNqzfpeey.svg)](https://asciinema.org/a/kDnXUOeqBxZVMoWuFNqzfpeey)
 
 ### Installation
 
-### Binary Release 
+### Binary Release
 
 #### MacOS
 
 ```sh
 curl -LSfs https://raw.githubusercontent.com/Byron/dua-cli/master/ci/install.sh | \
-    sh -s -- --git Byron/dua-cli --crate dua --tag v2.29.0
+    sh -s -- --git Byron/dua-cli --crate dua
 ```
 
 #### MacOS via [MacPorts](https://www.macports.org):
+
 ```sh
 sudo port selfupdate
 sudo port install dua-cli
 ```
 
 #### MacOS via [Homebrew](https://brew.sh)
+
 ```sh
 brew update
 brew install dua-cli
@@ -35,24 +39,40 @@ Linux requires the target to be specified explicitly to obtain the MUSL build.
 
 ```sh
 curl -LSfs https://raw.githubusercontent.com/Byron/dua-cli/master/ci/install.sh | \
-    sh -s -- --git Byron/dua-cli --target x86_64-unknown-linux-musl --crate dua --tag v2.29.0
+    sh -s -- --git Byron/dua-cli --target x86_64-unknown-linux-musl --crate dua
 ```
 
 #### Windows via [Scoop](https://scoop.sh/)
+
 ```sh
 scoop install dua
+```
+
+#### Windows via [WinGet](https://learn.microsoft.com/en-us/windows/package-manager/winget/)
+
+```sh
+winget install Byron.dua-cli
 ```
 
 #### Pre-built Binaries
 
 See the [releases section][releases] for manual installation of a binary, pre-built for many platforms.
 
+Release archives include build provenance attestations. After downloading an archive, verify that it
+was built by this repository with the [GitHub CLI](https://cli.github.com/):
+
+```sh
+gh attestation verify ./dua-v2.39.1-aarch64-apple-darwin.tar.gz --repo Byron/dua-cli
+```
+
 [releases]: https://github.com/Byron/dua-cli/releases
 
 #### Cargo
+
 Via `cargo`, which can be obtained using [rustup][rustup]
 
 For _Unix_…
+
 ```
 cargo install dua-cli
 
@@ -64,11 +84,13 @@ cargo install dua-cli --no-default-features --features tui-crossplatform
 ```
 
 For _Windows_, nightly features are currently required.
+
 ```
 cargo +nightly install dua-cli
 ```
 
 #### VoidLinux
+
 Via `xbps` on your VoidLinux system.
 
 ```
@@ -76,6 +98,7 @@ xbps-install dua-cli
 ```
 
 #### Fedora
+
 Via `dnf` on your Fedora system.
 
 ```
@@ -83,6 +106,7 @@ sudo dnf install dua-cli
 ```
 
 #### Arch Linux
+
 Via `pacman` on your ArchLinux system.
 
 ```
@@ -90,7 +114,8 @@ sudo pacman -S dua-cli
 ```
 
 #### NixOS
-https://search.nixos.org/packages?channel=23.11&show=dua&from=0&size=50&sort=relevance&type=packages&query=dua
+
+https://search.nixos.org/packages?query=dua
 
 Nix-shell (temporary)
 
@@ -107,6 +132,7 @@ NixOS configuration
 ```
 
 #### NetBSD
+
 Via `pkgin` on your NetBSD system.
 
 ```
@@ -129,6 +155,16 @@ Alternatively, install via cargo as in
 cargo +nightly install dua-cli
 ```
 
+#### x-cmd
+
+[x-cmd](https://www.x-cmd.com/) is a **toolbox for Posix Shell**, offering a lightweight package manager built using shell and awk.
+
+```sh
+x env use dua
+```
+
+- Additionally, the [`x dua ...`](https://www.x-cmd.com/pkg/dua#dua) command is available, which automatically installs `dua` without affecting the environment, such as not modifying the `PATH` variable.
+
 ### Usage
 
 ```bash
@@ -140,18 +176,157 @@ dua *
 dua aggregate --help
 ```
 
+On macOS, the `--deduplicate-apfs-clones` traversal option counts fully shared
+APFS file clones only once in aggregate and interactive runs. It is opt-in
+because collecting the additional metadata reduces traversal performance.
+Files that share only some blocks are not deduplicated, and `--apparent-size`
+still reports each file's logical length.
+
+### Tree output
+
+By default `aggregate` prints a flat listing. Pass `--depth N` to instead print an indented tree
+that descends `N` levels into each input, which is handy for sharing a disk-usage report without
+opening interactive mode. The inputs form the first level, so `--depth 1` lists just them, the same
+set of entries the flat listing shows.
+
+```bash
+# show each top-level entry and one level below it
+dua aggregate --depth 2
+```
+
+`--no-sort` and `--no-total` work the same way they do for the flat listing.
+
+### Excluding paths with a pattern file
+
+`--ignore-from FILE` reads gitignore-style patterns and leaves everything they match out of the
+report, in both aggregate and interactive mode. This is the `--exclude-from` of `rsync` and the
+`--exclude-file` of `restic`, so the same file can answer "how much of this would actually get
+backed up?".
+
+```bash
+cat .duaignore
+# /target/
+# **/node_modules/
+# *.log
+# !important.log
+
+dua --ignore-from .duaignore
+```
+
+Patterns follow `.gitignore` syntax - `#` comments, a trailing `/` to match directories only, a
+leading `/` to anchor to the current working directory or the traversal root, `**` to span directories,
+and `!` to re-include something an earlier pattern excluded. They match the paths `dua` reports, 
+which are relative to the directory being looked at, and matching is case-sensitive on every platform.
+
+The option can be given more than once, in which case later files win over earlier ones, and it
+can also be set through `DUA_IGNORE_FROM`. Excluded directories are not descended into at all, so
+their contents cannot be re-included - the same restriction Git has.
+
 ### Interactive Mode
 
 Launch into interactive mode with the `i` or `interactive` subcommand. Get help on keyboard
 shortcuts with `?`.
 Use this mode to explore, and/or to delete files and directories to release disk space.
 
-Please note that great care has been taken to prevent accidential deletions due to a multi-stage
+Press `]` to minimize or restore the entire right side. `Tab` cycles through visible panes;
+`?` restores and focuses Help when the right side is minimized.
+
+Please note that great care has been taken to prevent accidental deletions due to a multi-stage
 process, which makes this mode viable for exploration.
 
 ```bash
 dua i
 dua interactive
+```
+
+The interactive interface can be localized via the standard POSIX locale environment variables,
+in the usual order of precedence `LC_ALL` > `LC_MESSAGES` > `LANG`. English is the default. The
+following translations are listed in the order they were added: German (`de`), Japanese (`ja`),
+Korean (`ko`), and Simplified Chinese (`zh`, `zh_CN`, `zh_SG`, or `zh_Hans`). They are available
+when the locale uses UTF-8 or omits the codeset:
+
+Please [open an issue](https://github.com/Byron/dua-cli/issues/new) to request support for your
+language, if you would be available for reviewing it as well.
+
+```bash
+LANG=de_DE.UTF-8 dua i   # German interface
+LANG=ja_JP.UTF-8 dua i   # Japanese interface
+LANG=ko_KR.UTF-8 dua i   # Korean interface
+LANG=zh_CN.UTF-8 dua i   # Simplified Chinese interface
+```
+
+### Cleanup Mode
+
+`dua clean [DIRECTORY]...` finds disposable directories and lists them largest first as sizing
+finishes. With no paths, it searches the current directory. *Nothing is deleted automatically.*
+
+```bash
+dua clean ~/dev
+dua clean --depth 3 ~/dev ~/Downloads
+```
+
+Candidates include `node_modules`, Python caches and virtual environments, Cargo project `target`
+directories, and Zig's `.zig-cache`, `zig-cache`, and `zig-out`. In Git repositories, candidates
+must be ignored and contain no tracked files. Directories containing a `.git` entry (regardless
+of case) and paths excluded by traversal options are skipped.
+
+The hub groups sibling candidates and deeper candidates under their shared parent. Open a group
+to browse, sort, or search within it; go back to return to the hub. Use the usual marking and
+deletion keys. Marking a group selects only its candidates, leaving other contents untouched.
+
+- `R` in the hub repeats discovery; `r` rechecks the selected candidate or existing group members.
+- Inside a candidate, either refresh key rechecks the whole candidate. Refresh clears all marks.
+- Discovery is unlimited by default. `--depth 0` checks only the supplied directories for great speedups;
+  candidates are always sized completely.
+
+Traversal options, `--no-entry-check`, and `--once` are supported. Parent scanning, snapshot
+import, and snapshot export are unavailable.
+
+### Flame graphs
+
+`dua stacks` prints folded stacks—the "collapsed" interchange format read by flame-graph tools.
+Each line is an entry's path with `;` between its components, a space, and its size in bytes:
+
+```bash
+dua stacks > disk-usage.folded
+```
+
+`dua flamegraph` renders the same data with [`inferno`](https://github.com/jonhoo/inferno), writes
+the SVG to a temporary file, and opens it. Pass an output path to write the SVG without opening it.
+Both commands accept the usual traversal options as well as `--depth` and `--import`:
+
+```bash
+dua flamegraph
+dua flamegraph -o disk-usage.svg
+```
+
+### Configuration
+
+`dua` can read an optional configuration file from your OS-specific config directory:
+
+1. Linux/Unix: `$XDG_CONFIG_HOME/dua-cli/config.toml` (or the platform default config dir)
+2. macOS: `~/Library/Application Support/dua-cli/config.toml`
+3. Windows: `%APPDATA%\dua-cli\config.toml`
+
+If the file is missing, defaults are used.
+
+Run `dua config show-default` for a commented template containing every configurable keybinding.
+Use a string for one binding or an array for aliases; an empty array disables the action.
+For example:
+
+```toml
+[keys]
+# If true (default), close_pane keys ascend from the main pane.
+# If false, close_pane keys follow the quit behavior.
+esc_navigates_back = true
+
+close_pane = "esc"
+toggle_right_panes = "]"
+sort_by_name = "ctrl+n"
+
+# Disable permanent deletion and moving entries to the trash.
+delete_marked = []
+trash_marked = []
 ```
 
 ### Development
@@ -178,46 +353,41 @@ Maintaining both backends seemed more cumbersome than it's worth and add complex
 but I never liked that it seems to have dropped out of support.
 Thus `crossterm` is the only remaining backend and it's very actively developed.
 
-### Acknowledgements
-
-Thanks to [jwalk][jwalk], all there was left to do is to write a command-line interface. As `jwalk` matures, **dua** should benefit instantly.
-
 ### Limitations
 
-* Does not show symbolic links at all if no path is provided when invoking `dua`
-  * in an effort to skip symbolic links, for now there are pruned and are not used as a root. Symbolic links will be shown if they
+- Does not show symbolic links at all if no path is provided when invoking `dua`
+  - in an effort to skip symbolic links, for now there are pruned and are not used as a root. Symbolic links will be shown if they
     are not a traversal root, but will not be followed.
-* Interactive mode only looks good in dark terminals (see [this issue](https://github.com/Byron/dua-cli/issues/13))
-* _easy fix_: file names in main window are not truncated if too large. They are cut off on the right.
-* There are plenty of examples in `tests/fixtures` which don't render correctly in interactive mode.
+- Interactive mode only looks good in dark terminals (see [this issue](https://github.com/Byron/dua-cli/issues/13))
+- _easy fix_: file names in main window are not truncated if too large. They are cut off on the right.
+- There are plenty of examples in `tests/fixtures` which don't render correctly in interactive mode.
   This can be due to graphemes not interpreted correctly. With Chinese characters for instance,
   column sizes are not correctly computed, leading to certain columns not being shown.
-  In other cases, the terminal gets things wrong - I use alacritty, and with certain characaters it
+  In other cases, the terminal gets things wrong - I use alacritty, and with certain characters it
   performs worse than, say iTerm3.
   See https://github.com/minimaxir/big-list-of-naughty-strings/blob/master/blns.txt for the source.
-* In interactive mode, you will need about 60MB of memory for 1 million entries in the graph.
-* In interactive mode, the maximum amount of files is limited to 2^32 - 1 (`u32::max_value() - 1`) entries.
-  * One node is used as to 'virtual' root
-  * The actual amount of nodes stored might be lower, as there might be more edges than nodes, which are also limited by a `u32` (I guess)
-  * The limitation is imposed by the underlying [`petgraph`][petgraph] crate, which declares it as `unsafe` to use u64 for instance.
-  * It's possibly *UB* when that limit is reached, however, it was never observed either.
+- In interactive mode, you will need about 60MB of memory for 1 million entries in the graph.
+- In interactive mode, the maximum amount of files is limited to 2^32 - 1 (`u32::max_value() - 1`) entries.
+  - One node is used as to 'virtual' root
+  - The actual amount of nodes stored might be lower, as there might be more edges than nodes, which are also limited by a `u32` (I guess)
+  - The limitation is imposed by the underlying [`petgraph`][petgraph] crate, which declares it as `unsafe` to use u64 for instance.
+  - It's possibly _UB_ when that limit is reached, however, it was never observed either.
 
-### Similar Programs 
+### Similar Programs
 
-* **CLI:**
-  * `du`
-  * [`dust`](https://github.com/bootandy/dust)
-  * [`dutree`](https://github.com/nachoparker/dutree)
-  * [`pdu`](https://github.com/KSXGitHub/parallel-disk-usage)
-* **TUI:**
-  * [`ncdu`](https://dev.yorhel.nl/ncdu)
-  * [`gdu`](https://github.com/dundee/gdu)
-  * [`godu`](https://github.com/viktomas/godu)
-* **GUI:**
-  * [GNOME's Disk Usage Analyzer, a.k.a. `baobab`](https://wiki.gnome.org/action/show/Apps/DiskUsageAnalyzer)
-  * [Filelight](https://apps.kde.org/filelight/)
-  
+- **CLI:**
+  - `du`
+  - [`dust`](https://github.com/bootandy/dust)
+  - [`dutree`](https://github.com/nachoparker/dutree)
+  - [`pdu`](https://github.com/KSXGitHub/parallel-disk-usage)
+- **TUI:**
+  - [`ncdu`](https://dev.yorhel.nl/ncdu)
+  - [`gdu`](https://github.com/dundee/gdu)
+  - [`godu`](https://github.com/viktomas/godu)
+- **GUI:**
+  - [GNOME's Disk Usage Analyzer, a.k.a. `baobab`](https://wiki.gnome.org/action/show/Apps/DiskUsageAnalyzer)
+  - [Filelight](https://apps.kde.org/filelight/)
+
 [petgraph]: https://crates.io/crates/petgraph
 [rustup]: https://rustup.rs/
-[jwalk]: https://crates.io/crates/jwalk
 [tui]: https://github.com/fdehau/tui-rs

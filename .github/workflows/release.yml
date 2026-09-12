@@ -53,7 +53,7 @@ jobs:
         run: echo "${{ env.ARTIFACT_VERSION }}" > artifacts/release-version
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v1
+        uses: actions/upload-artifact@v4
         with:
           name: artifacts
           path: artifacts
@@ -62,6 +62,10 @@ jobs:
     name: build-release
     needs: ["create-release"]
     runs-on: ${{ matrix.os }}
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
     env:
       # For some builds, we use cross to test on 32-bit and big-endian
       # systems.
@@ -76,7 +80,7 @@ jobs:
       EXE_NAME: dua
     strategy:
       matrix:
-        build: [linux, linux-arm, linux-arm64, macos, win-msvc, win32-msvc]
+        build: [linux, linux-arm, linux-arm64, linux-riscv64, macos, macos-arm64, win-msvc, win32-msvc, win-msvc-arm]
         include:
           - build: linux
             os: ubuntu-latest
@@ -90,18 +94,30 @@ jobs:
             os: ubuntu-latest
             rust: stable
             target: aarch64-unknown-linux-musl
+          - build: linux-riscv64
+            os: ubuntu-latest
+            rust: stable
+            target: riscv64gc-unknown-linux-gnu
           - build: macos
-            os: macos-latest
+            os: macos-14
             rust: stable
             target: x86_64-apple-darwin
+          - build: macos-arm64
+            os: macos-14
+            rust: stable
+            target: aarch64-apple-darwin
           - build: win-msvc
-            os: windows-2019
+            os: windows-2022
             rust: nightly
             target: x86_64-pc-windows-msvc
           - build: win32-msvc
-            os: windows-2019
+            os: windows-2022
             rust: nightly
             target: i686-pc-windows-msvc
+          - build: win-msvc-arm
+            os: windows-2022
+            rust: nightly
+            target: aarch64-pc-windows-msvc
 
     steps:
       - name: Checkout repository
@@ -115,7 +131,7 @@ jobs:
           ci/ubuntu-install-packages
 
       - name: Install packages (macOS)
-        if: matrix.os == 'macos-latest'
+        if: startsWith(matrix.os, 'macos-')
         run: |
           ci/macos-install-packages
 
@@ -128,7 +144,7 @@ jobs:
           target: ${{ matrix.target }}
 
       - name: Use Cross
-        # if: matrix.os != 'windows-2019'
+        # if: matrix.os != 'windows-2022'
         run: |
           cargo install cross
           echo "CARGO=cross" >> $GITHUB_ENV
@@ -142,7 +158,7 @@ jobs:
           echo "target dir is: ${{ env.TARGET_DIR }}"
 
       - name: Get release download URL
-        uses: actions/download-artifact@v1
+        uses: actions/download-artifact@v4.1.7
         with:
           name: artifacts
           path: artifacts
@@ -161,7 +177,7 @@ jobs:
         run: ${{ env.CARGO }} build --verbose --release ${{ env.TARGET_FLAGS }}
 
       - name: Strip release binary (linux and macos)
-        if: matrix.build == 'linux' || matrix.build == 'macos'
+        if: matrix.build == 'linux' || startsWith(matrix.os, 'macos-')
         run: strip "target/${{ matrix.target }}/release/${{ env.EXE_NAME }}"
       - name: Strip release binary (arm)
         if: matrix.build == 'linux-arm'
@@ -179,6 +195,14 @@ jobs:
             messense/rust-musl-cross:aarch64-musl \
             musl-strip \
             /target/aarch64-unknown-linux-musl/release/${{ env.EXE_NAME }}
+      - name: Strip release binary (riscv64)
+        if: matrix.build == 'linux-riscv64'
+        run: |
+          docker run --rm -v \
+            "$PWD/target:/target:Z" \
+            rustembedded/cross:riscv64gc-unknown-linux-gnu \
+            riscv64-linux-gnu-strip \
+            /target/riscv64gc-unknown-linux-gnu/release/${{ env.EXE_NAME }}
       - name: Build archive
         shell: bash
         run: |
@@ -187,7 +211,7 @@ jobs:
 
           cp {README.md,LICENSE,CHANGELOG.md} "$staging/"
 
-          if [ "${{ matrix.os }}" = "windows-2019" ]; then
+          if [ "${{ matrix.os }}" = "windows-2022" ]; then
             # cp "target/${{ matrix.target }}/release/${{ env.EXE_NAME }}.exe" "$staging/"
             cp "target/release/${{ env.EXE_NAME }}.exe" "$staging/"
             7z a "$staging.zip" "$staging"
@@ -198,6 +222,11 @@ jobs:
             echo "ASSET=$staging.tar.gz" >> $GITHUB_ENV
           fi
 
+      - name: Attest release archive
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: ${{ env.ASSET }}
+
       - name: Upload release archive
         uses: actions/upload-release-asset@v1.0.1
         env:
@@ -207,3 +236,25 @@ jobs:
           asset_path: ${{ env.ASSET }}
           asset_name: ${{ env.ASSET }}
           asset_content_type: application/octet-stream
+
+  validate-release-install:
+    name: validate release installation
+    needs: ["build-release"]
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - run: sh ci/validate-release-install.sh "$GITHUB_REF_NAME"
+
+  winget-release:
+    name: winget-release
+    needs: ["build-release"]
+    runs-on: windows-latest
+    steps:
+      - uses: vedantmgoyal9/winget-releaser@main
+        with:
+          identifier: Byron.dua-cli
+          installers-regex: '-pc-windows-msvc\.zip$'
+          # This step uses russellbanks/Komac to submit manifests.
+          # It requires a PAT with `public_repo` scope.
+          # See https://github.com/marketplace/actions/winget-releaser#configuration-options-%EF%B8%8F
+          token: ${{ secrets.WINGET_TOKEN }}

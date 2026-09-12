@@ -1,39 +1,152 @@
 use std::collections::HashMap;
 
-#[derive(Debug, Default, Clone)]
-pub struct InodeFilter {
+// Darwin's `nlink_t` is 16 bits, so this marker cannot collide with an actual link count.
+#[cfg(target_os = "macos")]
+const UNRESOLVED_DIRECTORY_LINKS: u64 = u64::MAX;
+
+/// Tracks hard-linked inodes and, on macOS, fully shared APFS data streams.
+#[derive(Debug, Default)]
+pub(crate) struct InodeFilter {
     inner: HashMap<(u64, u64), u64>,
+    #[cfg(target_os = "macos")]
+    apfs: apfs::ApfsFilter,
 }
 
 impl InodeFilter {
+    /// Whether accepting this entry can affect accounting in another cleanup candidate.
+    pub(crate) fn needs_tracking(entry: &crate::walk::Entry, options: &crate::WalkOptions) -> bool {
+        let Some(Ok(metadata)) = &entry.metadata else {
+            return false;
+        };
+        if !options.count_hard_links {
+            #[cfg(unix)]
+            {
+                #[cfg(not(target_os = "macos"))]
+                use std::os::unix::fs::MetadataExt;
+                if metadata.nlink() > 1 {
+                    return true;
+                }
+                #[cfg(target_os = "macos")]
+                if entry.file_type.is_dir() {
+                    return true;
+                }
+            }
+            #[cfg(windows)]
+            if metadata.hard_link_id().is_some() {
+                return true;
+            }
+        }
+        #[cfg(target_os = "macos")]
+        if !options.apparent_size
+            && options.metadata_options.apfs_clone_metadata
+            && metadata.clone_id().is_some()
+        {
+            return true;
+        }
+        false
+    }
+
     #[cfg(unix)]
-    pub fn add(&mut self, metadata: &std::fs::Metadata) -> bool {
+    /// Register file metadata and return `true` if this link should be counted.
+    pub(crate) fn add(
+        &mut self,
+        entry: &crate::walk::Entry,
+        metadata: &crate::walk::Metadata,
+    ) -> bool {
+        #[cfg(not(target_os = "macos"))]
         use std::os::unix::fs::MetadataExt;
+
+        #[cfg(target_os = "macos")]
+        if entry.file_type.is_dir() {
+            return self.add_directory(entry, metadata);
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        let _ = entry;
 
         self.add_dev_inode((metadata.dev(), metadata.ino()), metadata.nlink())
     }
 
     #[cfg(windows)]
-    pub fn add(&mut self, metadata: &std::fs::Metadata) -> bool {
-        use std::os::windows::fs::MetadataExt;
-
-        if let (Some(dev), Some(inode), Some(nlinks)) = (
-            metadata.volume_serial_number(),
-            metadata.file_index(),
-            metadata.number_of_links(),
-        ) {
-            self.add_dev_inode((dev as u64, inode), nlinks as u64)
-        } else {
-            true
-        }
+    /// Register file metadata and return `true` if this link should be counted.
+    pub(crate) fn add(
+        &mut self,
+        _entry: &crate::walk::Entry,
+        metadata: &crate::walk::Metadata,
+    ) -> bool {
+        metadata
+            .hard_link_id()
+            .is_none_or(|id| self.inner.insert(id, 0).is_none())
     }
 
     #[cfg(not(any(unix, windows)))]
-    pub fn add(&mut self, metadata: &std::fs::Metadata) -> bool {
+    /// Register file metadata and return `true` if this link should be counted.
+    pub(crate) fn add(
+        &mut self,
+        _entry: &crate::walk::Entry,
+        metadata: &std::fs::Metadata,
+    ) -> bool {
         true
     }
 
-    pub fn add_dev_inode(&mut self, dev_inode: (u64, u64), nlinks: u64) -> bool {
+    /// Register a directory whose bulk link count may differ from `stat(2)` semantics.
+    ///
+    /// `ATTR_DIR_LINKCOUNT` omits the synthetic `.` and `..` links, so a bulk-enumerated directory
+    /// can report one link where `stat(2)` reports more. The first ambiguous observation is counted
+    /// and marked unresolved. Only a repeated `(device, inode)` pays for `symlink_metadata`; that
+    /// result initializes the ordinary link-count cycle without counting the first observation
+    /// twice.
+    ///
+    /// Returns `true` when the current directory observation should contribute to size/count.
+    #[cfg(target_os = "macos")]
+    fn add_directory(
+        &mut self,
+        entry: &crate::walk::Entry,
+        metadata: &crate::walk::Metadata,
+    ) -> bool {
+        let dev_inode = (metadata.dev(), metadata.ino());
+        let link_count = metadata.nlink();
+
+        match self.inner.get(&dev_inode).copied() {
+            None if link_count <= 1 => {
+                // ATTR_DIR_LINKCOUNT does not include the synthetic links reported by stat.
+                // Resolve the actual count only if an overlapping root revisits this directory.
+                self.inner.insert(dev_inode, UNRESOLVED_DIRECTORY_LINKS);
+                true
+            }
+            None => self.add_dev_inode(dev_inode, link_count),
+            Some(UNRESOLVED_DIRECTORY_LINKS) => {
+                let nlinks = if link_count > 1 {
+                    link_count
+                } else {
+                    use std::os::unix::fs::MetadataExt;
+
+                    std::fs::symlink_metadata(entry.path())
+                        .ok()
+                        .filter(|actual| (actual.dev(), actual.ino()) == dev_inode)
+                        .map_or(link_count, |actual| actual.nlink())
+                };
+
+                self.inner.remove(&dev_inode);
+                if nlinks <= 1 {
+                    return true;
+                }
+
+                // The first observation already contributed its size. Consume the current
+                // observation through the ordinary counter to retain its reset behavior.
+                self.inner.insert(dev_inode, nlinks - 1);
+                self.add_dev_inode(dev_inode, nlinks)
+            }
+            Some(remaining) => self.add_dev_inode(dev_inode, remaining + 1),
+        }
+    }
+
+    /// Register a `(device, inode)` with its hard-link count.
+    ///
+    /// Returns `true` for the first observation that should contribute to size/count,
+    /// and `false` for subsequent links.
+    #[cfg(any(unix, test))]
+    pub(crate) fn add_dev_inode(&mut self, dev_inode: (u64, u64), nlinks: u64) -> bool {
         if nlinks <= 1 {
             return true;
         }
@@ -51,6 +164,51 @@ impl InodeFilter {
                 self.inner.insert(dev_inode, nlinks - 1);
                 true
             }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod apfs {
+    use std::collections::HashSet;
+
+    impl super::InodeFilter {
+        /// Return allocated bytes while counting a cloned data stream only once.
+        pub(crate) fn allocated_size(&mut self, metadata: &crate::walk::Metadata) -> u64 {
+            if self.apfs.add_clone(metadata) {
+                metadata.allocated_size()
+            } else {
+                // Clone identifiers cover only the data fork; resource forks remain private.
+                metadata
+                    .allocated_size()
+                    .saturating_sub(metadata.data_allocated_size())
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    pub(super) struct ApfsFilter {
+        streams: HashSet<(u64, u64)>,
+        inodes: HashSet<(u64, u64)>,
+    }
+
+    impl ApfsFilter {
+        fn add_clone(&mut self, metadata: &crate::walk::Metadata) -> bool {
+            if metadata.allocated_size() == 0 {
+                return true;
+            }
+
+            let Some(clone_id) = metadata.clone_id() else {
+                return true;
+            };
+            let device = metadata.dev();
+
+            // Hard links and overlapping roots revisit one inode, not distinct cloned files.
+            if !self.inodes.insert((device, metadata.ino())) {
+                return true;
+            }
+
+            self.streams.insert((device, clone_id.get()))
         }
     }
 }

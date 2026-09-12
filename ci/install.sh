@@ -16,7 +16,7 @@ Options:
     --crate NAME    Name of the crate to install (default <repository name>)
     --tag TAG       Tag (version) of the crate to install (default <latest release>)
     --target TARGET Install the release compiled for $TARGET (default <`rustc` host>)
-    --to LOCATION   Where to install the binary (default ~/.cargo/bin)
+    --to LOCATION   Where to install the binary (default $CARGO_HOME/bin, or ~/.cargo/bin if CARGO_HOME is unset)
 EOF
 }
 
@@ -88,12 +88,8 @@ need mktemp
 need tar
 
 # Optional dependencies
-if [ -z $crate ] || [ -z $tag ] || [ -z $target ]; then
+if [ -z $crate ] || [ -z $target ]; then
     need cut
-fi
-
-if [ -z $tag ]; then
-    need rev
 fi
 
 if [ -z $target ]; then
@@ -117,7 +113,8 @@ say_err "Crate: $crate"
 url="$url/releases"
 
 if [ -z $tag ]; then
-    tag=$(curl -s "$url/latest" | cut -d'"' -f2 | rev | cut -d'/' -f1 | rev)
+    latest_url=$(curl -LSfs -o /dev/null -w '%{url_effective}' "$url/latest") || err "failed to determine latest release"
+    tag=${latest_url##*/}
     say_err "Tag: latest ($tag)"
 else
     say_err "Tag: $tag"
@@ -130,7 +127,7 @@ fi
 say_err "Target: $target"
 
 if [ -z $dest ]; then
-    dest="$HOME/.cargo/bin"
+    dest="${CARGO_HOME:-$HOME/.cargo}/bin"
 fi
 
 say_err "Installing to: $dest"
@@ -139,7 +136,10 @@ url="$url/download/$tag/$crate-$tag-$target.tar.gz"
 
 say_err "Downloading: $url"
 td=$(mktemp -d || mktemp -d -t tmp)
-curl -sL $url | tar -C $td -xz
+archive="$td/archive.tar.gz"
+curl -LSfs "$url" -o "$archive" || err "failed to download $url"
+tar -C "$td" -xzf "$archive" || err "failed to extract archive from $url"
+rm "$archive"
 
 for f in $(cd $td && find . -type f); do
     test -x $td/$f || continue

@@ -1,14 +1,17 @@
 use crate::interactive::{
-    app::tree_view::TreeView,
-    widgets::{Column, GlobPane, HelpPane, MainWindow, MarkMode, MarkPane},
     DisplayOptions, EntryDataBundle,
+    app::tree_view::TreeView,
+    widgets::{Column, GlobPane, HelpPane, MainWindow, MarkPane},
 };
-use crosstermion::input::Key;
+use crossterm::event::KeyEvent;
+use dua::Config;
 use dua::traverse::TreeIndex;
-use std::{fs, io, path::PathBuf};
-use tui::{backend::Backend, Terminal};
+use std::{collections::BTreeSet, path::PathBuf};
 
-use super::state::{AppState, FocussedPane::*};
+use super::state::{
+    AppState,
+    FocussedPane::{Glob, Help, Main, Mark},
+};
 
 #[derive(Copy, Clone)]
 pub enum CursorMode {
@@ -22,6 +25,12 @@ pub enum MarkEntryMode {
     MarkForDeletion,
 }
 
+#[derive(Clone, Copy)]
+enum AnnotationKind {
+    Cleanup,
+    Gitignored,
+}
+
 pub enum CursorDirection {
     PageDown,
     Down,
@@ -32,8 +41,21 @@ pub enum CursorDirection {
 }
 
 impl CursorDirection {
+    pub fn from_key(key: KeyEvent, keys: &dua::KeysConfig) -> Option<Self> {
+        [
+            (&keys.move_to_top, Self::ToTop),
+            (&keys.move_to_bottom, Self::ToBottom),
+            (&keys.page_up, Self::PageUp),
+            (&keys.move_up, Self::Up),
+            (&keys.move_down, Self::Down),
+            (&keys.page_down, Self::PageDown),
+        ]
+        .into_iter()
+        .find_map(|(binding, direction)| binding.matches(key).then_some(direction))
+    }
+
     pub fn move_cursor(&self, n: usize) -> usize {
-        use CursorDirection::*;
+        use CursorDirection::{Down, PageDown, PageUp, ToBottom, ToTop, Up};
         match self {
             ToTop => 0,
             ToBottom => usize::MAX,
@@ -46,38 +68,35 @@ impl CursorDirection {
 }
 
 impl AppState {
-    pub fn open_that(&self, tree_view: &TreeView<'_>) {
-        if let Some(idx) = self.navigation().selected {
-            open::that(tree_view.path_of(idx)).ok();
+    pub fn open_path(&mut self, path: Option<PathBuf>) {
+        if self.block_deletion_changes() {
+            return;
+        }
+        if let Some(path) = path {
+            let t = self.language.ui_text();
+            if self.read_only && !path.exists() {
+                self.message = Some(format!("{}{}", t.snapshot_path_unavailable, path.display()));
+                return;
+            }
+            if let Err(err) = open::that(&path) {
+                self.message = Some(format!("{}{}: {err}", t.failed_to_open, path.display()));
+            }
         }
     }
 
-    pub fn exit_node_with_traversal(&mut self, tree_view: &TreeView<'_>) {
-        let entries = self.entries_for_exit_node(tree_view);
-        self.exit_node(entries);
-    }
-
-    fn entries_for_exit_node(
-        &self,
-        tree_view: &TreeView<'_>,
-    ) -> Option<(TreeIndex, Vec<EntryDataBundle>)> {
-        tree_view
-            .view_parent_of(self.navigation().view_root)
-            .map(|parent_idx| {
-                (
-                    parent_idx,
-                    tree_view.sorted_entries(parent_idx, self.sorting, self.entry_check()),
-                )
-            })
-    }
-
-    pub fn exit_node(&mut self, entries: Option<(TreeIndex, Vec<EntryDataBundle>)>) {
-        match entries {
-            Some((parent_idx, entries)) => {
-                self.navigation_mut().exit_node(parent_idx, &entries);
-                self.entries = entries;
-            }
-            None => self.message = Some("Top level reached".into()),
+    pub fn exit_node_with_traversal(&mut self, tree_view: &TreeView<'_>, scan_parent_key: &str) {
+        if let Some(parent) = tree_view.view_parent_of(self.navigation().view_root) {
+            let navigation = self.navigation_mut();
+            navigation.view_root = parent;
+            navigation.selected = navigation.bookmarks.get(&parent).copied();
+            self.update_entries(tree_view);
+            self.reset_message();
+        } else {
+            self.message = Some(if self.can_scan_parent(tree_view) {
+                self.language.top_level_with_scan(scan_parent_key)
+            } else {
+                self.language.ui_text().top_level.into()
+            });
         }
     }
 
@@ -95,10 +114,14 @@ impl AppState {
 
     pub fn enter_node_with_traversal(&mut self, tree_view: &TreeView<'_>) {
         let new_entries = self.entries_for_enter_node(tree_view);
-        self.enter_node(new_entries)
+        self.enter_node(new_entries, tree_view);
     }
 
-    pub fn enter_node(&mut self, entries_at_selected: Option<(TreeIndex, Vec<EntryDataBundle>)>) {
+    pub fn enter_node(
+        &mut self,
+        entries_at_selected: Option<(TreeIndex, Vec<EntryDataBundle>)>,
+        tree_view: &TreeView<'_>,
+    ) {
         if let Some((previously_selected, new_entries)) = entries_at_selected {
             match self
                 .navigation()
@@ -108,8 +131,12 @@ impl AppState {
                     self.navigation_mut()
                         .enter_node(previously_selected, selected);
                     self.entries = new_entries;
+                    self.update_entry_annotations(tree_view);
+                    self.reset_message();
                 }
-                None => self.message = Some("Entry is a file or an empty directory".into()),
+                None => {
+                    self.message = Some(self.language.ui_text().entry_file_or_empty.into());
+                }
             }
         }
     }
@@ -121,37 +148,56 @@ impl AppState {
 
     pub fn cycle_sorting(&mut self, tree_view: &TreeView<'_>) {
         self.sorting.toggle_size();
-        self.entries = tree_view.sorted_entries(
-            self.navigation().view_root,
-            self.sorting,
-            self.entry_check(),
-        );
+        self.update_entries(tree_view);
     }
 
     pub fn cycle_mtime_sorting(&mut self, tree_view: &TreeView<'_>) {
         self.sorting.toggle_mtime();
-        self.entries = tree_view.sorted_entries(
-            self.navigation().view_root,
-            self.sorting,
-            self.entry_check(),
-        );
+        self.update_entries(tree_view);
     }
 
     pub fn cycle_count_sorting(&mut self, tree_view: &TreeView<'_>) {
         self.sorting.toggle_count();
-        self.entries = tree_view.sorted_entries(
-            self.navigation().view_root,
-            self.sorting,
-            self.entry_check(),
-        );
+        self.update_entries(tree_view);
     }
 
-    pub fn toggle_mtime_column(&mut self) {
-        self.toggle_column(Column::MTime);
+    pub fn cycle_name_sorting(&mut self, tree_view: &TreeView<'_>) {
+        self.sorting.toggle_name();
+        self.update_entries(tree_view);
+    }
+
+    pub fn cycle_mtime_sort_mode(&mut self, tree_view: &TreeView<'_>) {
+        if self.sorting.mtime_sort().is_some() {
+            self.sorting.cycle_mtime_sort();
+            self.update_entries(tree_view);
+        } else {
+            self.toggle_column(Column::MTime);
+        }
     }
 
     pub fn toggle_count_column(&mut self) {
         self.toggle_column(Column::Count);
+    }
+
+    pub fn toggle_cleanup_candidates(&mut self, tree_view: &TreeView<'_>) {
+        self.cleanup_candidates = self.cleanup_candidates.is_none().then(BTreeSet::new);
+        self.update_entry_annotations(tree_view);
+        self.reset_message();
+    }
+
+    pub fn toggle_gitignored_entries(&mut self, tree_view: &TreeView<'_>) {
+        if self.read_only {
+            self.message = Some(
+                self.language
+                    .ui_text()
+                    .gitignore_snapshot_unavailable
+                    .into(),
+            );
+            return;
+        }
+        self.gitignored_entries = self.gitignored_entries.is_none().then(BTreeSet::new);
+        self.update_entry_annotations(tree_view);
+        self.reset_message();
     }
 
     fn toggle_column(&mut self, column: Column) {
@@ -165,7 +211,7 @@ impl AppState {
     pub fn toggle_glob_search(&mut self, window: &mut MainWindow) {
         self.focussed = match self.focussed {
             Main | Mark | Help => {
-                window.glob_pane = Some(GlobPane::default());
+                window.glob = Some(GlobPane::default());
                 Glob
             }
             Glob => unreachable!("BUG: glob pane must catch the input leading here"),
@@ -173,192 +219,109 @@ impl AppState {
     }
 
     pub fn reset_message(&mut self) {
-        if self.scan.is_some() {
-            self.message = Some("-> scanning <-".into());
+        if let Some(deletion) = &self.deletion {
+            self.message = Some(deletion.message(self.language));
+        } else if self.scan.is_some() {
+            self.message = Some(self.language.ui_text().scanning.into());
+        } else if let Some(hub) = self.clean_hub.as_ref().filter(|hub| hub.root.is_none()) {
+            self.message = hub
+                .is_empty()
+                .then(|| self.language.ui_text().no_cleanup_candidates.into());
         } else {
-            self.message = None;
+            self.message = self.language.annotation_message(
+                self.cleanup_candidates.as_ref().map_or(0, BTreeSet::len),
+                self.gitignored_entries.as_ref().map_or(0, BTreeSet::len),
+            );
+        }
+    }
+
+    pub fn toggle_right_panes(&mut self, window: &mut MainWindow) {
+        if window.help.is_none() && window.mark.is_none() {
+            return;
+        }
+        window.right_panes_minimized = !window.right_panes_minimized;
+        if window.right_panes_minimized {
+            if let Some(pane) = window.mark.as_mut() {
+                pane.set_focus(false);
+            }
+            if matches!(self.focussed, Help | Mark) {
+                self.focussed = Main;
+            }
         }
     }
 
     pub fn toggle_help_pane(&mut self, window: &mut MainWindow) {
+        if window.right_panes_minimized {
+            window.right_panes_minimized = false;
+            window.help.get_or_insert_with(HelpPane::default);
+            self.focussed = Help;
+            return;
+        }
         self.focussed = match self.focussed {
             Main | Mark | Glob => {
-                window.help_pane = Some(HelpPane::default());
+                window.help = Some(HelpPane::default());
                 Help
             }
             Help => {
-                window.help_pane = None;
+                window.help = None;
                 Main
             }
         }
     }
     pub fn cycle_focus(&mut self, window: &mut MainWindow) {
-        if let Some(p) = window.mark_pane.as_mut() {
-            p.set_focus(false)
-        };
+        if let Some(p) = window.mark.as_mut() {
+            p.set_focus(false);
+        }
+        if window.right_panes_minimized {
+            self.focussed = if self.focussed == Main && window.glob.is_some() {
+                Glob
+            } else {
+                Main
+            };
+            return;
+        }
         self.focussed = match (
             self.focussed,
-            &window.help_pane,
-            &mut window.mark_pane,
-            &mut window.glob_pane,
+            &window.help,
+            &mut window.mark,
+            &mut window.glob,
         ) {
             (Main, Some(_), _, _) => Help,
-            (Help, _, Some(ref mut pane), _) => {
+            (Help, _, Some(pane), _) | (Main, None, Some(pane), _) => {
                 pane.set_focus(true);
                 Mark
             }
-            (Help, _, _, Some(_)) => Glob,
-            (Help, _, None, None) => Main,
-            (Mark, _, _, Some(_)) => Glob,
-            (Mark, _, _, _) => Main,
-            (Main, None, None, None) => Main,
-            (Main, None, Some(ref mut pane), _) => {
-                pane.set_focus(true);
-                Mark
-            }
-            (Main, None, None, Some(_)) => Glob,
-            (Glob, _, _, _) => Main,
+            (Help | Mark, _, _, Some(_)) | (Main, None, None, Some(_)) => Glob,
+            (Help, _, None, None) | (Mark | Glob, _, _, _) | (Main, None, None, None) => Main,
         };
     }
 
-    pub fn dispatch_to_mark_pane<B>(
+    pub fn dispatch_to_mark_pane(
         &mut self,
-        key: Key,
+        key: KeyEvent,
         window: &mut MainWindow,
         tree_view: &mut TreeView<'_>,
         display: DisplayOptions,
-        terminal: &mut Terminal<B>,
-    ) where
-        B: Backend,
-    {
-        let res = window.mark_pane.take().and_then(|p| p.process_events(key));
-        window.mark_pane = match res {
-            Some((pane, mode)) => match mode {
-                Some(MarkMode::Delete) => {
-                    self.message = Some("Deleting items...".to_string());
-                    let mut entries_deleted = 0;
-                    let res = pane.iterate_deletable_items(|mut pane, entry_to_delete| {
-                        window.mark_pane = Some(pane);
-                        self.draw(window, tree_view, display, terminal).ok();
-                        pane = window.mark_pane.take().expect("option to be filled");
-                        match self.delete_entry(entry_to_delete, tree_view) {
-                            Ok(ed) => {
-                                entries_deleted += ed;
-                                self.message =
-                                    Some(format!("Deleted {} items...", entries_deleted));
-                                Ok(pane)
-                            }
-                            Err(c) => Err((pane, c)),
-                        }
-                    });
-                    self.message = None;
-                    res
-                }
-                #[cfg(feature = "trash-move")]
-                Some(MarkMode::Trash) => {
-                    self.message = Some("Trashing items...".to_string());
-                    let mut entries_trashed = 0;
-                    let res = pane.iterate_deletable_items(|mut pane, entry_to_trash| {
-                        window.mark_pane = Some(pane);
-                        self.draw(window, tree_view, display, terminal).ok();
-                        pane = window.mark_pane.take().expect("option to be filled");
-                        match self.trash_entry(entry_to_trash, tree_view) {
-                            Ok(ed) => {
-                                entries_trashed += ed;
-                                self.message =
-                                    Some(format!("Trashed {} items...", entries_trashed));
-                                Ok(pane)
-                            }
-                            Err(c) => Err((pane, c)),
-                        }
-                    });
-                    self.message = None;
-                    res
-                }
-                None => Some(pane),
-            },
-            None => None,
-        };
-        if window.mark_pane.is_none() {
+        config: &Config,
+    ) {
+        if window.right_panes_minimized {
+            return;
+        }
+        let res = window
+            .mark
+            .take()
+            .and_then(|pane| pane.process_events(key, &config.keys, !self.is_deleting()));
+        if let Some((pane, mode)) = res {
+            window.mark = Some(pane);
+            if let Some(mode) = mode
+                && let Err(err) = self.start_deletion(window, tree_view, display, mode)
+            {
+                self.message = Some(err.to_string());
+            }
+        }
+        if window.mark.is_none() && self.focussed == Mark {
             self.focussed = Main;
         }
-    }
-
-    pub fn delete_entry(
-        &mut self,
-        index: TreeIndex,
-        tree_view: &mut TreeView<'_>,
-    ) -> Result<usize, usize> {
-        let mut entries_deleted = 0;
-        if tree_view.exists(index) {
-            let path_to_delete = tree_view.path_of(index);
-            delete_directory_recursively(path_to_delete)?;
-            entries_deleted = self.delete_entries_in_traversal(index, tree_view);
-        }
-        Ok(entries_deleted)
-    }
-
-    #[cfg(feature = "trash-move")]
-    pub fn trash_entry(
-        &mut self,
-        index: TreeIndex,
-        tree_view: &mut TreeView<'_>,
-    ) -> Result<usize, usize> {
-        let mut entries_deleted = 0;
-        if tree_view.exists(index) {
-            let path_to_delete = tree_view.path_of(index);
-            if trash::delete(path_to_delete).is_err() {
-                return Err(1);
-            }
-            entries_deleted = self.delete_entries_in_traversal(index, tree_view);
-        }
-        Ok(entries_deleted)
-    }
-
-    pub fn delete_entries_in_traversal(
-        &mut self,
-        index: TreeIndex,
-        tree_view: &mut TreeView<'_>,
-    ) -> usize {
-        let parent_idx = tree_view
-            .fs_parent_of(index)
-            .expect("us being unable to delete the root index");
-        let entries_deleted =
-            tree_view.remove_entries(index, true /* remove node at `index` */);
-
-        if !tree_view.exists(self.navigation().view_root) {
-            self.go_to_root(tree_view);
-        } else {
-            self.entries = tree_view.sorted_entries(
-                self.navigation().view_root,
-                self.sorting,
-                self.entry_check(),
-            );
-        }
-
-        if self
-            .navigation()
-            .selected
-            .and_then(|selected| self.entries.iter().find(|e| e.index == selected))
-            .is_none()
-        {
-            let idx = self.entries.first().map(|e| e.index);
-            self.navigation_mut().select(idx);
-        }
-        tree_view.recompute_sizes_recursively(parent_idx);
-
-        entries_deleted
-    }
-
-    pub fn go_to_root(&mut self, tree_view: &TreeView<'_>) {
-        let root = self.navigation().tree_root;
-        let entries = tree_view.sorted_entries(root, self.sorting, self.entry_check());
-        self.navigation_mut().exit_node(root, &entries);
-        self.entries = entries;
-    }
-
-    pub fn glob_root(&self) -> Option<TreeIndex> {
-        self.glob_navigation.as_ref().map(|e| e.tree_root)
     }
 
     fn mark_entry_by_index(
@@ -368,22 +331,23 @@ impl AppState {
         window: &mut MainWindow,
         tree_view: &TreeView<'_>,
     ) {
+        if self.block_deletion_changes() {
+            return;
+        }
+        let Some(data) = tree_view.tree().data(index) else {
+            return;
+        };
         let is_dir = self
             .entries
             .iter()
-            .find(|e| e.index == index)
-            .unwrap()
-            .is_dir;
-        let should_toggle = match mode {
-            MarkEntryMode::Toggle => true,
-            MarkEntryMode::MarkForDeletion => false,
-        };
-        if let Some(pane) = window.mark_pane.take() {
-            window.mark_pane = pane.toggle_index(index, tree_view, is_dir, should_toggle);
-        } else {
-            window.mark_pane =
-                MarkPane::default().toggle_index(index, tree_view, is_dir, should_toggle)
-        }
+            .find(|entry| entry.index == index)
+            .map_or(data.is_dir, |entry| entry.is_dir);
+        window.mark = window.mark.take().unwrap_or_default().toggle_index(
+            index,
+            tree_view,
+            is_dir,
+            matches!(mode, MarkEntryMode::Toggle),
+        );
     }
 
     pub fn mark_entry(
@@ -393,11 +357,14 @@ impl AppState {
         window: &mut MainWindow,
         tree_view: &TreeView<'_>,
     ) {
+        if self.block_deletion_changes() {
+            return;
+        }
         if let Some(index) = self.navigation().selected {
             self.mark_entry_by_index(index, mode, window, tree_view);
-        };
+        }
         if let CursorMode::Advance = cursor {
-            self.change_entry_selection(CursorDirection::Down)
+            self.change_entry_selection(CursorDirection::Down);
         }
     }
 
@@ -407,75 +374,144 @@ impl AppState {
         window: &mut MainWindow,
         tree_view: &TreeView<'_>,
     ) {
+        if self.block_deletion_changes() {
+            return;
+        }
         for index in self.entries.iter().map(|e| e.index).collect::<Vec<_>>() {
             self.mark_entry_by_index(index, mode, window, tree_view);
         }
     }
-}
 
-fn into_error_count(res: Result<(), io::Error>) -> usize {
-    match res.map_err(io_err_to_usize) {
-        Ok(_) => 0,
-        Err(c) => c,
-    }
-}
-
-fn io_err_to_usize(err: io::Error) -> usize {
-    if err.kind() == io::ErrorKind::NotFound {
-        0
-    } else {
-        1
-    }
-}
-
-// TODO: could use jwalk for this
-// see https://github.com/Byron/dua-cli/issues/43
-fn delete_directory_recursively(path: PathBuf) -> Result<(), usize> {
-    let mut files_or_dirs = vec![path];
-    let mut dirs = Vec::new();
-    let mut num_errors = 0;
-    while let Some(path) = files_or_dirs.pop() {
-        let assume_symlink_to_try_deletion = true;
-        let is_symlink = path
-            .symlink_metadata()
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(assume_symlink_to_try_deletion);
-        if is_symlink {
-            // do not follow symlinks
-            num_errors += into_error_count(fs::remove_file(&path));
-            continue;
+    pub fn mark_cleanup_candidates(&mut self, window: &mut MainWindow, tree_view: &TreeView<'_>) {
+        if self.block_deletion_changes() {
+            return;
         }
-        match fs::read_dir(&path) {
-            Ok(iterator) => {
-                dirs.push(path);
-                for entry in iterator {
-                    match entry.map_err(io_err_to_usize) {
-                        Ok(entry) => files_or_dirs.push(entry.path()),
-                        Err(c) => num_errors += c,
-                    }
+        match self.cleanup_candidates.clone() {
+            Some(cleanup_candidates) => self.mark_annotation_candidates(
+                cleanup_candidates,
+                AnnotationKind::Cleanup,
+                window,
+                tree_view,
+            ),
+            None => {
+                self.message = Some(self.language.ui_text().cleanup_detection_disabled.into());
+            }
+        }
+    }
+
+    pub fn mark_gitignored_entries(&mut self, window: &mut MainWindow, tree_view: &TreeView<'_>) {
+        if self.block_deletion_changes() {
+            return;
+        }
+        match self.gitignored_entries.clone() {
+            Some(gitignored_entries) => self.mark_annotation_candidates(
+                gitignored_entries,
+                AnnotationKind::Gitignored,
+                window,
+                tree_view,
+            ),
+            None => {
+                self.message = Some(self.language.ui_text().gitignore_detection_disabled.into());
+            }
+        }
+    }
+
+    fn mark_annotation_candidates(
+        &mut self,
+        annotation_candidates: BTreeSet<TreeIndex>,
+        kind: AnnotationKind,
+        window: &mut MainWindow,
+        tree_view: &TreeView<'_>,
+    ) {
+        let already_marked = window.mark.as_ref().map(MarkPane::marked);
+        let candidates = self
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                let is_candidate = annotation_candidates.contains(&entry.index);
+                let is_marked =
+                    already_marked.is_some_and(|marked| marked.contains_key(&entry.index));
+                (is_candidate && !is_marked).then_some(entry.index)
+            })
+            .collect::<Vec<_>>();
+
+        for index in &candidates {
+            self.mark_entry_by_index(*index, MarkEntryMode::MarkForDeletion, window, tree_view);
+        }
+
+        if candidates.is_empty() {
+            let t = self.language.ui_text();
+            self.message = Some(
+                match (kind, annotation_candidates.is_empty()) {
+                    (AnnotationKind::Cleanup, true) => t.no_cleanup_candidates,
+                    (AnnotationKind::Cleanup, false) => t.cleanup_candidates_already_marked,
+                    (AnnotationKind::Gitignored, true) => t.no_gitignored_entries,
+                    (AnnotationKind::Gitignored, false) => t.gitignored_entries_already_marked,
                 }
-            }
-            // Err(ref e) if e.kind() == io::ErrorKind::NotADirectory => {
-            //     // assume file, save IOps
-            //     num_errors += into_error_count(fs::remove_file(path));
-            //     continue;
-            // }
-            Err(_) => {
-                // TODO: Reintroduce commented code once the `io_error_more` feature is stable
-                // num_errors += 1;
-                num_errors += into_error_count(fs::remove_file(path));
-                continue;
-            }
-        };
+                .into(),
+            );
+        } else {
+            self.message =
+                Some(self.language.marked_candidates(
+                    candidates.len(),
+                    matches!(kind, AnnotationKind::Gitignored),
+                ));
+        }
     }
 
-    for dir in dirs.into_iter().rev() {
-        num_errors += into_error_count(fs::remove_dir(&dir).or_else(|_| fs::remove_file(dir)));
+    pub(super) fn update_entries(&mut self, tree: &TreeView<'_>) {
+        if self
+            .clean_hub
+            .as_ref()
+            .is_some_and(|hub| hub.root.is_none())
+        {
+            self.entries.clear();
+            return;
+        }
+        self.entries = tree.sorted_entries(
+            self.navigation().view_root,
+            self.sorting,
+            self.entry_check(),
+        );
+        let selected = self
+            .navigation()
+            .selected
+            .filter(|selected| self.entries.iter().any(|entry| entry.index == *selected))
+            .or_else(|| self.entries.first().map(|entry| entry.index));
+        self.navigation_mut().selected = selected;
+        self.update_entry_annotations(tree);
     }
 
-    if num_errors == 0 {
-        Ok(())
-    } else {
-        Err(num_errors)
+    pub fn update_entry_annotations(&mut self, tree_view: &TreeView<'_>) {
+        if self.glob_navigation.is_some() {
+            if self.cleanup_candidates.is_some() {
+                self.cleanup_candidates = Some(BTreeSet::default());
+            }
+            if self.gitignored_entries.is_some() {
+                self.gitignored_entries = Some(BTreeSet::default());
+            }
+        } else {
+            if self.cleanup_candidates.is_some() {
+                self.cleanup_candidates = Some(super::cleanup::cleanup_candidates(&self.entries));
+            }
+            if self.is_deleting() {
+                // Progress and navigation must not reread a potentially large Git index.
+                // Retain known annotations until completion can check the current view again.
+                if let Some(known) = &self.gitignored_entries {
+                    self.gitignored_entries = Some(
+                        self.entries
+                            .iter()
+                            .filter_map(|entry| known.contains(&entry.index).then_some(entry.index))
+                            .collect(),
+                    );
+                }
+            } else if self.gitignored_entries.is_some() {
+                self.gitignored_entries = Some(super::gitignore::gitignored_entries(
+                    tree_view,
+                    &self.display_path(tree_view),
+                    &self.entries,
+                ));
+            }
+        }
     }
 }

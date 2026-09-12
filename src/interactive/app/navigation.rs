@@ -1,6 +1,7 @@
 use dua::traverse::TreeIndex;
 use itertools::Itertools;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use super::{CursorDirection, EntryDataBundle};
 
@@ -10,6 +11,8 @@ pub struct Navigation {
     pub view_root: TreeIndex,
     pub selected: Option<TreeIndex>,
     pub bookmarks: BTreeMap<TreeIndex, TreeIndex>,
+    /// Real entries exposed by a scoped root or glob search; empty for ordinary tree roots.
+    pub matches: Arc<[TreeIndex]>,
 }
 
 impl Navigation {
@@ -38,15 +41,6 @@ impl Navigation {
         self.selected = Some(new_selected);
     }
 
-    pub fn exit_node(&mut self, parent_idx: TreeIndex, entries: &[EntryDataBundle]) {
-        self.view_root = parent_idx;
-        self.selected = self
-            .bookmarks
-            .get(&parent_idx)
-            .copied()
-            .or_else(|| entries.first().map(|b| b.index));
-    }
-
     pub fn next_index(
         &self,
         direction: CursorDirection,
@@ -56,8 +50,7 @@ impl Navigation {
             Some(ref selected) => entries
                 .iter()
                 .find_position(|b| b.index == *selected)
-                .map(|(idx, _)| direction.move_cursor(idx))
-                .unwrap_or(0),
+                .map_or(0, |(idx, _)| direction.move_cursor(idx)),
             None => 0,
         };
 
